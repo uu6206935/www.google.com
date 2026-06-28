@@ -55,6 +55,10 @@ const double POT_MIN_V = 0.135;
 const double POT_MAX_V = 0.748;
 const double RT_PRESSED_MIN_V = 1.5;
 const double RT_PRESSED_MAX_V = 3.4;
+// これ以下のブレーキ指令は「ブレーキ解放」とみなし、ブレーキモーターを停止させる。
+// 何も操作していない状態(brake_norm≒0)で到達不能な目標を追い続けてモーターが
+// カタカタ鳴るのを防ぐためのデッドゾーン。
+const double BRAKE_RELEASE_THRESHOLD = 0.02;
 const int32_t MAX_STEERING_STEP = 24000;
 const uint32_t MAX_STEERING_SPEED = 0x00010000; // 自動運転モード時の最大操舵速度
 
@@ -664,11 +668,23 @@ void control_thread_func() {
             double current_voltage_ain0 = 0.0;
             eAIN(ljHandle, 0, 31, &current_voltage_ain0, 0, 0, 0, 0, 0, 0);
             g_actual_voltage_pot = current_voltage_ain0;
-            double target_voltage_pot_local = map_value(brake_norm, 0.0, 1.0, POT_MIN_V, POT_MAX_V);
-            double error = target_voltage_pot_local - current_voltage_ain0;
+
+            // ブレーキ指令を 0〜1 にクランプ（共有メモリの値が範囲外でも安全にする）
+            double brake_cmd = std::max(0.0, std::min(1.0, brake_norm));
+
+            // デフォルトはモーター停止
             double dac1_output_v = MOTOR_STOP_V;
-            if (error > TOLERANCE_V) dac1_output_v = MOTOR_FORWARD_V;
-            else if (error < -TOLERANCE_V) dac1_output_v = MOTOR_REVERSE_V;
+
+            // ブレーキ指令がしきい値を超えたときだけ位置制御(bang-bang)を行う。
+            // 何も操作していない状態(brake_cmd≒0)では到達不能な目標を追い続けて
+            // モーターが端で突っ張りカタカタ鳴るため、その場合は停止のままにする。
+            if (brake_cmd > BRAKE_RELEASE_THRESHOLD) {
+                double target_voltage_pot_local = map_value(brake_cmd, 0.0, 1.0, POT_MIN_V, POT_MAX_V);
+                double error = target_voltage_pot_local - current_voltage_ain0;
+                if (error > TOLERANCE_V) dac1_output_v = MOTOR_FORWARD_V;
+                else if (error < -TOLERANCE_V) dac1_output_v = MOTOR_REVERSE_V;
+            }
+
             set_dac_voltage(ljHandle, 1, dac1_output_v);
             set_dac_voltage(ljHandle, 0, throttle_to_set);
         }
