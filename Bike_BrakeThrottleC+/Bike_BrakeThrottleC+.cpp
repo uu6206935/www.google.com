@@ -90,6 +90,13 @@ std::atomic<bool> g_keyboard_throttle_mode(false);
 std::atomic<double> g_throttle_input_norm(0.0);
 std::atomic<double> g_brake_input_norm(0.0);
 
+// --- ブレーキ制御の診断用（ダッシュボード表示） ---
+// 実際にブレーキアクチュエータを動かしているのは sm[224](目標ブレーキ強度) であり、
+// ゲームパッドのトリガ(g_brake_input_norm)ではない。原因切り分けのため実値を表示する。
+std::atomic<double> g_brake_cmd(0.0);            // 実際に使われたブレーキ指令 (sm[224] をクランプした値)
+std::atomic<double> g_brake_target_v(0.0);       // 目標ポテンショ電圧
+std::atomic<double> g_brake_motor_v(MOTOR_STOP_V); // ブレーキモーターへの出力(DAC1)
+
 // --- DFP/XInput 優先権管理 ---
 enum class InputDevicePriority {
     None,
@@ -675,15 +682,21 @@ void control_thread_func() {
             // デフォルトはモーター停止
             double dac1_output_v = MOTOR_STOP_V;
 
+            double target_voltage_pot_local = map_value(brake_cmd, 0.0, 1.0, POT_MIN_V, POT_MAX_V);
+
             // ブレーキ指令がしきい値を超えたときだけ位置制御(bang-bang)を行う。
             // 何も操作していない状態(brake_cmd≒0)では到達不能な目標を追い続けて
             // モーターが端で突っ張りカタカタ鳴るため、その場合は停止のままにする。
             if (brake_cmd > BRAKE_RELEASE_THRESHOLD) {
-                double target_voltage_pot_local = map_value(brake_cmd, 0.0, 1.0, POT_MIN_V, POT_MAX_V);
                 double error = target_voltage_pot_local - current_voltage_ain0;
                 if (error > TOLERANCE_V) dac1_output_v = MOTOR_FORWARD_V;
                 else if (error < -TOLERANCE_V) dac1_output_v = MOTOR_REVERSE_V;
             }
+
+            // 診断用に実値を公開
+            g_brake_cmd = brake_cmd;
+            g_brake_target_v = target_voltage_pot_local;
+            g_brake_motor_v = dac1_output_v;
 
             set_dac_voltage(ljHandle, 1, dac1_output_v);
             set_dac_voltage(ljHandle, 0, throttle_to_set);
@@ -778,6 +791,19 @@ void draw_dashboard() {
     out << "[VEHICLE]\n";
     out << "  Speed     : [" << format_field(g_vehicle_speed_kmh.load(), 2, 8) << "] km/h\n";
     out << "  BrakePos  : [" << format_field(brk,                        1, 8) << "] %\n";
+    out << "\n";
+    // ブレーキ制御の実値（カタカタ原因の切り分け用）
+    // Cmd sm224 = 実際にアクチュエータを動かす指令。何も操作していないのにここが0でなければ
+    //             原因は上位プロセス(PathFollower)/共有メモリ側。MotorOut が常時 FWD/REV なら駆動中。
+    const double motor_v = g_brake_motor_v.load();
+    const char* motor_state =
+        (motor_v > MOTOR_STOP_V + 0.1) ? "FWD(pull)" :
+        (motor_v < MOTOR_STOP_V - 0.1) ? "REV(release)" : "STOP";
+    out << "[BRAKE CTRL]\n";
+    out << "  Cmd sm224 : [" << format_field(g_brake_cmd.load(),      3, 8) << "]\n";
+    out << "  TargetV   : [" << format_field(g_brake_target_v.load(), 3, 8) << "] V\n";
+    out << "  ActualV   : [" << format_field(g_actual_voltage_pot.load(), 3, 8) << "] V\n";
+    out << "  MotorOut  : [" << format_field(motor_state,            12) << "]\n";
     out << "\n";
     out << "[POSITION]\n";
     out << "  X         : [" << format_field(g_gnss_x.load(), 3, 8) << "] m\n";
